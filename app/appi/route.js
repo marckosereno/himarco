@@ -534,3 +534,196 @@ export async function POST(request) {
         if (forcedCanonicalResponse) {
             return NextResponse.json({ responseText: JSON.stringify(forcedCanonicalResponse) });
         }
+// ====================================================================
+        // ⭐️ LÓGICA NORMAL (GEMINI + RAG de Reseñas)
+        // ====================================================================
+
+        let promptToSend = userPrompt;
+
+        // Patrón para detectar solicitudes de listado/recomendación
+        const recommendationPattern = new RegExp(`(dime|recomienda|sugiere|dame|busca|quiero|lista|muestra).*\\s+(\\d+|unos cuantos)?\\s*(taquería|restaurante|tienda|barbacoa|lugar|souvenirs|artesanias|clinica|farmacia|dental|optica)s?`, 'i');
+
+        // Patrón para detectar preguntas de planificación o seguimiento general
+        const generalConversationalPattern = new RegExp(`(a donde ir|que hacer|ruta|orden de actividades|sugerencia de plan|plan de viaje|que visitar|que me sugieres|que sugieres|que hago ahora|siguiente paso|que me recomiendas|que hay|a dónde voy|what to do|where to go|travel plan|what to suggest|suggestions|next step|what next|where to visit|things to do|route|que mas hay|que mas hago|que mas|entonces que)s?`, 'i');
+
+        // Lógica de intercepción de CONVERSACIÓN GENERAL
+        if (userPrompt.match(generalConversationalPattern)) {
+
+            console.log("PROTOCOLO CONVERSACIONAL GENERAL ACTIVADO - FORZANDO TEXTO PLANO.");
+
+            promptToSend = currentLanguage === 'es'
+                ? `El usuario pide una sugerencia general, un plan de viaje, una ruta u orden de actividades. **IGNORA TODAS LAS REGLAS DE JSON/FICHAS Y RESPONDE ÚNICAMENTE CON TEXTO CONVERSACIONAL Y EN TEXTO PLANO (MODO CONVERSACIONAL)**. Responde amablemente y continúa la conversación. Puedes usar puntos, guiones (-) o saltos de línea. **CRÍTICO: Para hacer énfasis, DEBES resaltar las frases importantes en negrita usando el formato de doble asterisco (**).**`
+                : `The user asks for a general suggestion, travel plan, route, or order of activities. **IGNORE ALL JSON/CARD RULES AND RESPOND ONLY WITH CONVERSATIONAL PLAIN TEXT (CONVERSATIONAL MODE)**. Respond kindly and continue the conversation. You may use dots, dashes (-), or line breaks. **CRITICAL: To provide emphasis, you MUST highlight important phrases in bold using the double asterisk (**) format.**`;
+
+        } else {
+            // Lógica original para búsqueda de categorías específicas
+            const match = userPrompt.match(recommendationPattern);
+
+            if (match) {
+                const categoryKeyRaw = match[3].toLowerCase();
+                let categoryName = currentLanguage === 'es' ? "lugares y negocios" : "places and businesses";
+
+                // Traducción de categorías
+                if (categoryKeyRaw.includes('taque') || categoryKeyRaw.includes('tacos')) categoryName = currentLanguage === 'es' ? "Taquerías y Tacos" : "Taco Stands and Taquerias";
+                else if (categoryKeyRaw.includes('restaurante') || categoryKeyRaw.includes('comer')) categoryName = currentLanguage === 'es' ? "Restaurantes y Comida" : "Restaurants and Food";
+                else if (categoryKeyRaw.includes('artesanias') || categoryKeyRaw.includes('souvenirs')) categoryName = currentLanguage === 'es' ? "Tiendas de Artesanías y Souvenirs" : "Handicraft and Souvenir Shops";
+                else if (categoryKeyRaw.includes('barbacoa')) categoryName = currentLanguage === 'es' ? "Barbacoa y Birria" : "Barbacoa and Birria";
+                else if (categoryKeyRaw.includes('dental') || categoryKeyRaw.includes('optica') || categoryKeyRaw.includes('clinica') || categoryKeyRaw.includes('farmacia')) categoryName = currentLanguage === 'es' ? "Salud y Estética" : "Health and Aesthetics";
+
+                // Sobrescribir el prompt para FORZAR el MODO FICHA DE CATEGORÍA
+                promptToSend = currentLanguage === 'es'
+                    ? `El usuario pidió una recomendación o lista de ${categoryName}. DEBES usar el MODO FICHA DE CATEGORÍA (JSON) para responder. **CRÍTICO: El campo 'description' DEBE contener un texto de 3-4 líneas totalmente CONVERSACIONAL y amable que introduzca al usuario a la categoría ${categoryName} y sus opciones en Nuevo Progreso. Nunca uses la palabra 'recomendar' ni asteriscos (*).** NUNCA GENERES FICHAS DE 'place' O LISTAS DE LUGARES ESPECÍFICOS. Tu respuesta debe ser un ÚNICO JSON de tipo 'category'.`
+                    : `The user asked for a recommendation or list of ${categoryName}. You MUST use the CATEGORY CARD MODE (JSON) to respond. **CRITICAL: The 'description' field MUST contain a fully CONVERSATIONAL and friendly text of 3-4 lines that introduces the user to the ${categoryName} category and its options in Nuevo Progreso. Never use the word 'recommend' or asterisks (*).** NEVER GENERATE 'place' CARDS OR LISTS OF SPECIFIC PLACES. Your response must be a SINGLE 'category' type JSON.`;
+
+                console.log("PROTOCOLO CATEGORÍA GENERAL ACTIVADO para:", categoryName);
+            }
+        }
+
+        // Inicializar el chat con el historial
+        const chat = ai.chats.create({
+            model: MODEL_NAME,
+            config: {
+                systemInstruction: finalSystemInstruction
+            },
+            history: history,
+            tools: [{ googleSearch: {} }]
+        });
+
+        const result = await chat.sendMessage({ message: promptToSend });
+        let modelResponseText = result.text.trim();
+
+        let finalResponseData = { responseText: modelResponseText };
+
+        // ====================================================================
+        // Lógica de ENRIQUECIMIENTO con Places API
+        // ====================================================================
+        try {
+            const jsonStart = modelResponseText.indexOf('{');
+            const jsonEnd = modelResponseText.lastIndexOf('}');
+
+            if (jsonStart !== -1 && jsonEnd !== -1) {
+                const jsonString = modelResponseText.substring(jsonStart, jsonEnd + 1);
+                const parsedJson = JSON.parse(jsonString);
+
+                let fichasToProcess = parsedJson.isStructured ? [parsedJson] : (parsedJson.isMultiStructured ? parsedJson.response : []);
+
+                if (fichasToProcess.length > 0) {
+
+                    const enrichedFichas = [];
+
+                    for (const ficha of fichasToProcess) {
+                        let enrichedFicha = { ...ficha };
+
+                        if (ficha.type === 'place' && ficha.placeToSearch) {
+
+                            const placeNameSearch = ficha.placeToSearch.trim();
+                            const searchForPlaces = placeNameSearch;
+
+                            const placeData = await getPlaceDetails(searchForPlaces, currentLanguage);
+                            const isHealthPlace = placeData?.isHealthPlace || ficha.isHealthPlace === true;
+
+                            // BLINDAJE ANTI-CORRELACIÓN
+                            let isNameMiscorrelated = false;
+                            if (placeData && !areNamesSimilar(placeNameSearch, placeData.name)) {
+                                console.warn(`¡Fallo de correlación! Se buscó "${placeNameSearch}" pero Places devolvió "${placeData.name}". Descartando resultado.`);
+                                isNameMiscorrelated = true;
+                            }
+
+                            if (placeData && !isNameMiscorrelated) {
+                                // LÓGICA NORMAL: USAR RE-PROMPT con GOOGLE SEARCH RAG
+
+                                let placePrompt = currentLanguage === 'es'
+                                    ? `El usuario preguntó por "${placeNameSearch}". Genera el JSON de FICHA DE LUGAR para responder. La categoría es: ${enrichedFicha.placeCategory}. **CRÍTICO: Al buscar reseñas, DEBES IGNORAR CUALQUIER CONTEXTO GEOGRÁFICO EXTERNO A NUEVO PROGRESO, TAMAULIPAS.** **UTILIZA TU HERRAMIENTA DE GOOGLE SEARCH** para buscar la consulta: "reseñas de ${placeNameSearch} ${enrichedFicha.placeCategory} Nuevo Progreso". **CRÍTICO: Extrae 1-2 frases CLAVE de reseñas REALES. Si citas, usa comillas dobles. Si no encuentras reseñas relevantes, DEJA el campo 'description' como un simple texto de fallback (ej: 'Servicios de alta calidad en la zona céntrica').** La descripción debe ser corta, estar basada en las reseñas encontradas, y enfocada en lo que dicen los clientes. **CRÍTICO: Evita las frases de inicio repetitivas como 'Se comenta que' o 'Según las reseñas'. Responde en ${langText}.** Solo usa la descripción que el RAG te proporciona.`
+                                    : `The user asked for "${placeNameSearch}". Generate the PLACE CARD JSON to respond. The category is: ${enrichedFicha.placeCategory}. **CRITICAL: When searching for reviews, you MUST IGNORE ANY GEOGRAPHICAL CONTEXT EXTERNAL TO NUEVO PROGRESO, TAMAULIPAS.** **USE YOUR GOOGLE SEARCH TOOL** to search the query: "reviews for ${placeNameSearch} ${enrichedFicha.placeCategory} Nuevo Progreso". **CRITICAL: Extract 1-2 KEY phrases from REAL reviews. If you quote, use double quotes. If you cannot find relevant reviews, LEAVE the 'description' field as a simple fallback text (e.g., 'High quality services in the downtown area').** The description must be short, based on the reviews found, and focused on what customers say. **CRITICAL: Avoid repetitive starting phrases like 'It is commented that' or 'According to reviews'. Respond in ${langText}.** Only use the description provided by the RAG.`;
+
+                                // Usar un nuevo chat para no contaminar el historial
+                                const ragChat = ai.chats.create({
+                                    model: MODEL_NAME,
+                                    config: {
+                                        systemInstruction: finalSystemInstruction
+                                    }
+                                });
+
+                                const rePromptResult = await ragChat.sendMessage({
+                                    message: placePrompt,
+                                    tools: [{ googleSearch: {} }]
+                                });
+                                const rePromptText = rePromptResult.text.trim();
+
+                                try {
+                                    const reParsedJson = JSON.parse(rePromptText.substring(rePromptText.indexOf('{'), rePromptText.lastIndexOf('}') + 1));
+
+                                    const cleanedName = cleanPlaceName(placeData.name);
+
+                                    enrichedFicha = {
+                                        ...reParsedJson,
+                                        placeName: cleanedName,
+                                        mapUrl: placeData.mapUrl,
+                                        imageUrl: placeData.imageUrl,
+                                        placePhone: isHealthPlace ? null : placeData.phone,
+                                        reviewUrl: placeData.reviewUrl,
+                                        websiteUrl: isHealthPlace ? null : placeData.websiteUrl,
+                                    };
+                                } catch (e) {
+                                    console.error("Fallo al re-parsear el JSON de anti-alucinación RAG. Usando ficha original sin descripción RAG.", e);
+
+                                    enrichedFicha = {
+                                        ...enrichedFicha,
+                                        placeName: placeData.name,
+                                        mapUrl: placeData.mapUrl,
+                                        imageUrl: placeData.imageUrl,
+                                        placePhone: isHealthPlace ? null : placeData.phone,
+                                        reviewUrl: placeData.reviewUrl,
+                                        websiteUrl: isHealthPlace ? null : placeData.websiteUrl,
+                                    };
+                                }
+
+                            } else {
+                                // Si NO existe (Fallo de geofencing, API, o Correlación)
+                                enrichedFicha = {
+                                    type: "place_not_found",
+                                    placeToSearch: placeNameSearch,
+                                    description: translations.notFoundGeofence.replace('{query}', placeNameSearch),
+                                    isStructured: true
+                                };
+                            }
+                        } else if (ficha.type === 'category') {
+                            // ENRIQUECIMIENTO PARA CATEGORÍA (Mapa)
+
+                            const categorySearch = ficha.categoryName.replace(/en Progreso/i, '').trim();
+                            const mapUrlQuery = categorySearch + GEOGRAPHIC_CONTEXT;
+
+                            const mapUrl = speedTestUrl(mapUrlQuery);
+
+                            enrichedFicha.mapUrl = mapUrl;
+                        }
+
+                        enrichedFichas.push(enrichedFicha);
+                    }
+
+                    // Reconstruir la respuesta final
+                    let finalResponseJson = parsedJson.isMultiStructured
+                        ? { isMultiStructured: true, response: enrichedFichas, conversationText: parsedJson.conversationText || '' }
+                        : enrichedFichas[0];
+
+                    finalResponseData.responseText = JSON.stringify(finalResponseJson);
+
+                } else {
+                    finalResponseData.responseText = modelResponseText;
+                }
+            }
+        } catch (jsonError) {
+            console.error("Fallo en el parseo o enriquecimiento del JSON.", jsonError);
+            finalResponseData.responseText = modelResponseText;
+        }
+
+        return NextResponse.json(finalResponseData);
+
+    } catch (error) {
+        console.error("Error en la API de Gemini:", error);
+        return NextResponse.json({
+            error: true,
+            message: (error.message || "Error interno del servidor")
+        }, { status: 500 });
+    }
+}
