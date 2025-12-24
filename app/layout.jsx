@@ -12,6 +12,23 @@ export default function RootLayout({ children }) {
   return (
     <html lang="es">
       <head>
+<head>
+  {/* 🔧 CONSOLA DE DEBUG TEMPORAL */}
+  <Script 
+    src="https://cdn.jsdelivr.net/npm/eruda"
+    strategy="beforeInteractive"
+  />
+  <Script id="eruda-init" strategy="beforeInteractive">
+    {`eruda.init();`}
+  </Script>
+  
+  {/* Lottie Files Script */}
+  <Script 
+    src="https://unpkg.com/@lottiefiles/dotlottie-wc@0.8.5/dist/dotlottie-wc.js" 
+    strategy="beforeInteractive"
+  />
+</head>
+
         {/* Lottie Files Script */}
         <Script 
           src="https://unpkg.com/@lottiefiles/dotlottie-wc@0.8.5/dist/dotlottie-wc.js" 
